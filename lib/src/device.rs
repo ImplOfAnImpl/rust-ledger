@@ -1,6 +1,6 @@
 //! High-level Ledger [Device] abstraction for application development
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use encdec::{EncDec, Encode};
 use tracing::{debug, error};
@@ -15,103 +15,117 @@ use ledger_proto::{
 
 use crate::{
     info::{AppInfo, DeviceInfo},
-    Error, NonSendExchange,
+    Error, Exchange,
 };
 
 const APDU_BUFF_LEN: usize = 256;
 
-/// [Device] provides a high-level interface exchanging APDU objects with implementers of [NonSendExchange].
-#[allow(async_fn_in_trait)]
-pub trait Device {
+/// [Device] provides a high-level interface exchanging APDU objects with implementers of [Exchange].
+pub trait Device: Send {
     /// Issue a request APDU, returning a response APDU
-    async fn request<'a, 'b, RESP: EncDec<'b, ApduError>>(
+    fn request<'a, 'b, RESP: EncDec<'b, ApduError>>(
         &mut self,
-        request: impl ApduReq<'a>,
+        request: impl ApduReq<'a> + Send,
         buff: &'b mut [u8],
         timeout: Duration,
-    ) -> Result<RESP, Error>;
+    ) -> impl Future<Output = Result<RESP, Error>> + Send;
 
     /// Fetch application information
-    async fn app_info(&mut self, timeout: Duration) -> Result<AppInfo, Error> {
-        let mut buff = [0u8; APDU_BUFF_LEN];
+    fn app_info(
+        &mut self,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<AppInfo, Error>> + Send {
+        async move {
+            let mut buff = [0u8; APDU_BUFF_LEN];
 
-        let r = self
-            .request::<AppInfoResp>(AppInfoReq {}, &mut buff[..], timeout)
-            .await?;
+            let r = self
+                .request::<AppInfoResp>(AppInfoReq {}, &mut buff[..], timeout)
+                .await?;
 
-        Ok(AppInfo {
-            name: r.name.to_string(),
-            version: r.version.to_string(),
-            flags: r.flags,
-        })
+            Ok(AppInfo {
+                name: r.name.to_string(),
+                version: r.version.to_string(),
+                flags: r.flags,
+            })
+        }
     }
 
     /// Fetch device information
-    async fn device_info(&mut self, timeout: Duration) -> Result<DeviceInfo, Error> {
-        let mut buff = [0u8; APDU_BUFF_LEN];
+    fn device_info(
+        &mut self,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<DeviceInfo, Error>> + Send {
+        async move {
+            let mut buff = [0u8; APDU_BUFF_LEN];
 
-        let r = self
-            .request::<DeviceInfoResp>(DeviceInfoReq {}, &mut buff[..], timeout)
-            .await?;
+            let r = self
+                .request::<DeviceInfoResp>(DeviceInfoReq {}, &mut buff[..], timeout)
+                .await?;
 
-        Ok(DeviceInfo {
-            target_id: r.target_id,
-            se_version: r.se_version.to_string(),
-            mcu_version: r.mcu_version.to_string(),
-            flags: r.flags.to_vec(),
-        })
+            Ok(DeviceInfo {
+                target_id: r.target_id,
+                se_version: r.se_version.to_string(),
+                mcu_version: r.mcu_version.to_string(),
+                flags: r.flags.to_vec(),
+            })
+        }
     }
 
     /// Fetch list of installed apps
-    async fn app_list(&mut self, timeout: Duration) -> Result<Vec<AppData>, Error> {
-        let mut buff = [0u8; APDU_BUFF_LEN];
+    fn app_list(
+        &mut self,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<Vec<AppData>, Error>> + Send {
+        async move {
+            let mut buff = [0u8; APDU_BUFF_LEN];
 
-        let mut app_data_list: Vec<AppData> = Default::default();
+            let mut app_data_list: Vec<AppData> = Default::default();
 
-        let mut start: bool = true;
+            let mut start: bool = true;
 
-        loop {
-            let r = match start {
-                true => {
-                    self.request::<GenericApdu>(AppListStartReq {}, &mut buff[..], timeout)
-                        .await
-                }
-                false => {
-                    self.request::<GenericApdu>(AppListNextReq {}, &mut buff[..], timeout)
-                        .await
-                }
-            };
+            loop {
+                let r = match start {
+                    true => {
+                        self.request::<GenericApdu>(AppListStartReq {}, &mut buff[..], timeout)
+                            .await
+                    }
+                    false => {
+                        self.request::<GenericApdu>(AppListNextReq {}, &mut buff[..], timeout)
+                            .await
+                    }
+                };
 
-            start = false;
+                start = false;
 
-            match r {
-                Ok(apdu_output) => {
-                    let mut offset: usize = 1;
-                    while offset < apdu_output.data.len() - 2 {
-                        let data = decode_app_data(apdu_output.data.as_slice(), &mut offset)
-                            .map_err(Error::from)?;
-                        app_data_list.push(data);
+                match r {
+                    Ok(apdu_output) => {
+                        let mut offset: usize = 1;
+                        while offset < apdu_output.data.len() - 2 {
+                            let data = decode_app_data(apdu_output.data.as_slice(), &mut offset)
+                                .map_err(Error::from)?;
+                            app_data_list.push(data);
+                        }
+                    }
+                    Err(Error::Status(StatusCode::Ok)) => {
+                        break;
+                    }
+                    Err(e) => {
+                        error!("Command failed: {e:?}");
+                        return Err(e);
                     }
                 }
-                Err(Error::Status(StatusCode::Ok)) => {
-                    break;
-                }
-                Err(e) => {
-                    error!("Command failed: {e:?}");
-                    return Err(e);
-                }
             }
+            Ok(app_data_list)
         }
-        Ok(app_data_list)
     }
 }
 
-/// Generic [Device] implementation for types supporting [NonSendExchange]
-impl<T: NonSendExchange> Device for T {
+/// Generic [Device] implementation for types supporting [Exchange]
+impl<T: Exchange + Send> Device for T {
     /// Issue a request APDU to a device, encoding and decoding internally then returning a response APDU
     async fn request<'a, 'b, RESP: EncDec<'b, ApduError>>(
         &mut self,
-        req: impl ApduReq<'a>,
+        req: impl ApduReq<'a> + Send,
         buff: &'b mut [u8],
         timeout: Duration,
     ) -> Result<RESP, Error> {
